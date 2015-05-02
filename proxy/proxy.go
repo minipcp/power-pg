@@ -1,37 +1,29 @@
-package main
+package proxy
 
 import (
-	"flag"
+	"github.com/minipcp/power-pg/common"
 	"fmt"
 	"net"
 	"os"
 	"io"
-	/*
-	"regexp"
-	"strings"
-	"github.com/mgutz/ansi"
-	*/
+	"encoding/binary"
 )
 
 
 var (
 	connid = uint64(0)
-	localHost = ":9876"
-	remoteHost = flag.String("r", "localhost:5432", "Endereço do servidor PostgreSQL")
 )
 
+func Start(localHost, remoteHost *string, powerCallback common.Callback) {
+	fmt.Printf("Proxying from %v to %v\n", localHost, remoteHost)
 
-func main() {
-	flag.Parse()
-	fmt.Printf("Redirecionando de %v para %v\n", localHost, remoteHost)
-
-	localAddr, remoteAddr := getEnderecosResolvidos(&localHost, remoteHost)
+	localAddr, remoteAddr := getResolvedAddresses(localHost, remoteHost)
 	listener := getListener(localAddr)
 
 	for {
 		conn, err := listener.AcceptTCP()
 		if err != nil {
-			fmt.Printf("Erro ao aceitar conexão '%s'\n", err)
+			fmt.Printf("Failed to accept connection '%s'\n", err)
 			continue
 		}
 		connid++
@@ -44,12 +36,12 @@ func main() {
 			errsig:   make(chan bool),
 			prefix:   fmt.Sprintf("Connection #%03d ", connid),
 		}
-		go p.start()
+		go p.start(powerCallback)
 	}
 }
 
 
-func getEnderecosResolvidos(localHost, remoteHost *string) (*net.TCPAddr, *net.TCPAddr) {
+func getResolvedAddresses(localHost, remoteHost *string) (*net.TCPAddr, *net.TCPAddr) {
 	laddr, err := net.ResolveTCPAddr("tcp", *localHost)
 	check(err)
 	raddr, err := net.ResolveTCPAddr("tcp", *remoteHost)
@@ -88,7 +80,7 @@ func (p *proxy) err(s string, err error) {
 }
 
 
-func (p *proxy) start() {
+func (p *proxy) start(powerCallback common.Callback) {
 	defer p.lconn.Close()
 	//connect to remote
 	rconn, err := net.DialTCP("tcp", nil, p.raddr)
@@ -99,14 +91,14 @@ func (p *proxy) start() {
 	p.rconn = rconn
 	defer p.rconn.Close()
 	//bidirectional copy
-	go p.pipe(p.lconn, p.rconn)
-	go p.pipe(p.rconn, p.lconn)
+	go p.pipe(p.lconn, p.rconn, powerCallback)
+	go p.pipe(p.rconn, p.lconn, nil)
 	//wait for close...
 	<-p.errsig
 }
 
 
-func (p *proxy) pipe(src, dst *net.TCPConn) {
+func (p *proxy) pipe(src, dst *net.TCPConn, powerCallback common.Callback) {
 	//data direction
 	islocal := src == p.lconn
 	//directional copy (64k buffer)
@@ -120,8 +112,7 @@ func (p *proxy) pipe(src, dst *net.TCPConn) {
 		b := buff[:n]
 		//show output
 		if islocal {
-			b = getBufferTratado(b)
-			fmt.Println(fmt.Sprintf("%s", string(b)))
+			b = getModifiedBuffer(b, powerCallback)
 			n, err = dst.Write(b)
 		} else {
 			//write out result
@@ -131,25 +122,27 @@ func (p *proxy) pipe(src, dst *net.TCPConn) {
 			p.err("Write failed '%s'\n", err)
 			return
 		}
-		if islocal {
-			p.sentBytes += uint64(n)
-		} else {
-			p.receivedBytes += uint64(n)
-		}
 	}
 }
 
 
-func getBufferTratado(buffer []byte) []byte {
-	primeiraLetra := string(buffer[:1])
-	fmt.Println(string(buffer[5:10]))
-	if primeiraLetra != "Q" || string(buffer[5:10]) != "power" {
+func getModifiedBuffer(buffer []byte, powerCallback common.Callback) []byte {
+	if powerCallback == nil || len(buffer) < 1 || string(buffer[0]) != "Q" || string(buffer[5:11]) != "power:" {
 		return buffer
 	}
-	query := "select * from clientes limit 1;"
-	queryArray := make([]byte, len(query))
-	copy(queryArray[:], query)
-	return append(buffer[1:4], queryArray...)
+	query := powerCallback(string(buffer[5:]))
+	return makeMessage(query)
+}
+
+
+func makeMessage(query string) []byte {
+	queryArray := make([]byte, 0, 6+len(query))
+	queryArray = append(queryArray, 'Q', 0, 0, 0, 0)
+	queryArray = append(queryArray, query...)
+	queryArray = append(queryArray, 0)
+	binary.BigEndian.PutUint32(queryArray[1:], uint32(len(queryArray)-1))
+	return queryArray
+
 }
 
 
@@ -164,3 +157,4 @@ func check(err error) {
 func warn(f string, args ...interface{}) {
 	fmt.Printf(f+"\n", args...)
 }
+
